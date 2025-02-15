@@ -113,3 +113,7 @@ add_builtin(
         fmt
     INCLUDE_DIRS
         runtime)
+
+# Module builtins
+
+add_builtin(builtins/node/fs.cpp)

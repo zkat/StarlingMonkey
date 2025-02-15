@@ -1,6 +1,11 @@
 #include "host_api.h"
 #include "bindings/bindings.h"
 #include "handles.h"
+#include <filesystem>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
 
 static std::optional<wasi_clocks_monotonic_clock_own_pollable_t> immediately_ready;
 
@@ -130,8 +135,7 @@ HttpHeaders::HttpHeaders(std::unique_ptr<HandleState> state)
     : HttpHeadersReadOnly(std::move(state)) {}
 
 HttpHeaders::HttpHeaders() {
-  handle_state_ =
-      std::make_unique<WASIHandle<HttpHeaders>>(wasi_http_types_constructor_fields());
+  handle_state_ = std::make_unique<WASIHandle<HttpHeaders>>(wasi_http_types_constructor_fields());
 }
 
 Result<HttpHeaders *> HttpHeaders::FromEntries(vector<tuple<HostString, HostString>> &entries) {
@@ -386,10 +390,10 @@ class BodyWriteAllTask final : public api::AsyncTask {
 
 public:
   explicit BodyWriteAllTask(HttpOutgoingBody *outgoing_body, HostBytes bytes,
-                          api::TaskCompletionCallback completion_callback,
-                          HandleObject callback_receiver)
-      : outgoing_body_(outgoing_body), cb_(completion_callback),
-        cb_receiver_(callback_receiver), bytes_(std::move(bytes)) {
+                            api::TaskCompletionCallback completion_callback,
+                            HandleObject callback_receiver)
+      : outgoing_body_(outgoing_body), cb_(completion_callback), cb_receiver_(callback_receiver),
+        bytes_(std::move(bytes)) {
     outgoing_pollable_ = outgoing_body_->subscribe().unwrap();
   }
 
@@ -426,9 +430,7 @@ public:
     return true;
   }
 
-  [[nodiscard]] int32_t id() override {
-    return outgoing_pollable_;
-  }
+  [[nodiscard]] int32_t id() override { return outgoing_pollable_; }
 
   void trace(JSTracer *trc) override {
     JS::TraceEdge(trc, &cb_receiver_, "BodyWriteAllTask completion callback receiver");
@@ -436,7 +438,8 @@ public:
 };
 
 Result<Void> HttpOutgoingBody::write_all(api::Engine *engine, HostBytes bytes,
-  api::TaskCompletionCallback callback, HandleObject cb_receiver) {
+                                         api::TaskCompletionCallback callback,
+                                         HandleObject cb_receiver) {
   if (!valid()) {
     // TODO: proper error handling for all 154 error codes.
     return Result<Void>::err(154);
@@ -700,8 +703,7 @@ HttpOutgoingRequest *HttpOutgoingRequest::make(string_view method_str, optional<
     wasi_http_types_method_outgoing_request_set_authority(borrow, maybe_authority);
 
     // TODO: error handling on result
-    wasi_http_types_method_outgoing_request_set_path_with_query(borrow,
-                                                                      maybe_path_with_query);
+    wasi_http_types_method_outgoing_request_set_path_with_query(borrow, maybe_path_with_query);
   }
 
   auto *state = new WASIHandle<HttpOutgoingRequest>(handle);
@@ -989,6 +991,193 @@ Result<HttpIncomingBody *> HttpIncomingRequest::body() {
     body_ = new HttpIncomingBody(std::unique_ptr<HandleState>(new IncomingBodyHandle(body)));
   }
   return Result<HttpIncomingBody *>::ok(body_);
+}
+
+namespace filesystem {
+
+namespace types {
+
+Descriptor::Descriptor(std::unique_ptr<HandleState> state) { handle_state_ = std::move(state); }
+
+Result<Descriptor *> Descriptor::open_at(uint64_t path_flags, string_view path, uint64_t open_flags,
+                                         uint64_t flags) {
+  wasi_filesystem_types_own_descriptor_t ret{};
+  wasi_filesystem_types_error_code_t err{};
+  auto borrow = Borrow<Descriptor>(handle_state_.get());
+  if (wasi_filesystem_types_method_descriptor_open_at(
+          borrow, path_flags, &string_view_to_world_string(path), open_flags, flags, &ret, &err)) {
+    auto state = new WASIHandle<Descriptor>(ret);
+    return Result<Descriptor *>::ok(new Descriptor(std::unique_ptr<HandleState>(state)));
+  } else {
+    // TODO: handle `err` (dump it? idk)
+    // TODO: idk what this magical `154` is but I imagine it doesn't apply to
+    // filesystem ops, since I just took it from the Http stuff, but I'm looking
+    // at other stuff first.
+    return Result<Descriptor *>::err(154);
+  }
+}
+
+Result<Descriptor::ReadResult> Descriptor::read_sync(size_t offset, uint64_t chunk_size) {
+  typedef Result<ReadResult> Res;
+
+  bindings_list_u8_t ret{};
+  wasi_io_streams_stream_error_t err{};
+  auto body_handle = IncomingDescriptorHandle::cast(handle_state_.get());
+  auto borrow = Borrow<InputStream>(body_handle->stream_handle_);
+  bool success = wasi_io_streams_method_input_stream_read(borrow, chunk_size, &ret, &err);
+  if (!success) {
+    if (err.tag == WASI_IO_STREAMS_STREAM_ERROR_CLOSED) {
+      return Res::ok(ReadResult(true, nullptr, 0));
+    }
+    dump_io_error(err);
+    return Res::err(154);
+  }
+  return Res::ok(ReadResult(false, unique_ptr<uint8_t[]>(ret.ptr), ret.len));
+}
+
+namespace impl {
+
+// TODO(@zkat): Add appropriate stuff to the .h
+// TODO(@zkat): optional -> Result where failures are actually errors.
+
+using std::string;
+// All lazily initialized to avoid startup cost.
+static bool cwd_initialized{false};
+static optional<const string> cwd_str{nullopt};
+static optional<Descriptor *> cwd_fd{nullopt};
+// You might think you want a fancy tree here but you don't. This is only ever
+// going to have like 2-3 items. A vector is probably already overkill.
+// Benchmark later if this seems suspect.
+static optional<vector<tuple<Descriptor *, string>> *> preopens{nullopt};
+
+optional<Descriptor *> get_init_cwd_fd() {
+  auto maybe_init_cwd = host_api::environment_initial_cwd();
+  if (maybe_init_cwd.has_value()) {
+  } else {
+    return std::nullopt;
+  }
+}
+
+optional<const Descriptor *> get_cwd() {
+  if (!cwd_initialized) {
+    cwd_str = host_api::environment_initial_cwd();
+    if (cwd_str.has_value()) {
+      string_view cwd_val = cwd_str.value();
+      auto base = relative_to(cwd_val, false);
+      if (base.has_value()) {
+        auto &[fd, base_path] = base.value();
+        // TODO(@zkat): uhhh... flags. Those are important. lol
+        auto res = fd->open_at(0, cwd_val.substr(base_path.length()), 0, 0);
+        // TODO(@zkat): I think this'll bubble up as an error in the right place
+        // just fine? Might change this function to return a Result later if I
+        // want it to give more explicit errors.
+        if (res.is_err())
+          return nullopt;
+        cwd_fd = res.unwrap();
+      }
+    }
+    cwd_initialized = true;
+  }
+  return cwd_fd;
+}
+
+optional<tuple<Descriptor *, const std::string_view>> relative_to(string_view const &path) {
+  return relative_to(path, cwd_initialized);
+}
+
+optional<tuple<Descriptor *, const std::string_view>> relative_to(string_view const &path,
+                                                                  bool search_relative_paths) {
+  // NB(@zkat): I'm making a HUGE assumption here, which is that preopened paths
+  // are always returned as absolute paths. It has not been See if `path` is an
+  // absolute path prefixed by any of the preopened directories. The reference
+  // I'm looking at literally just says `Return the set of preopened
+  // directories, and their path.` 🙃
+  // I'm betting on absolute paths just like I bet on JS.
+  auto base = find_base(path);
+
+  if (base.has_value()) {
+    auto &[fd, fd_path] = base.value();
+    return tuple(fd, std::filesystem::relative(path, fd_path).string());
+  }
+
+  // If we haven't found one, it might be relative. So we go ahead and try that
+  // next, using our cwd, if any.
+
+  // NB(@zkat): This is mainly meant for `get_cwd()`, to base case recursion.
+  if (!search_relative_paths)
+    return nullopt;
+
+  // If we have a relative path, let's go ahead and check it against cwd.
+  if (
+      // NB(@zkat): C++ treats `/`-rooted paths as relative on Windows. I would
+      // not expect this to be a problem, but I'm not sure what it's going to do
+      // when running in wasmtime/StarlingMonkey on Windows, so I'm just gonna
+      // hard-code the one correct answer (because `WASI` explicitly only accepts
+      // `/`. This is safe.)
+      !path.starts_with('/') && cwd_str.has_value()) {
+    string_view cwd = cwd_str.value();
+    std::filesystem::path p(cwd);
+    p /= path;
+    string new_path = p.string();
+    auto base = find_base(new_path);
+    if (base.has_value()) {
+      auto &[fd, fd_path] = base.value();
+      return tuple(fd, std::filesystem::relative(new_path, fd_path).string());
+    }
+  }
+
+  return nullopt;
+}
+
+// Helper. Assumes you're calling it through `relative_to`.
+optional<tuple<Descriptor *, const string_view>> find_base(string_view const &path) {
+  if (!preopens.has_value()) {
+    // Only initialize if we're actually going to try and open something.
+    preopens = preopens::get_directories();
+  }
+  // NB(@zkat): Uhhh... I'm not _entirely_ sure the `*` here is appropriate but YOLO for
+  // now. Still wrapping my head around how pointer stuff is done in this
+  // project/wasi/etc.
+  for (auto &[fd, base_path] : *preopens.value()) {
+    // NB(@zkat): I am assuming, for right now, that the
+    // `preopens_get_directories()` paths are all absolute, since... I'm not
+    // sure where to start if I had to hand-resolve them.
+    if (path.starts_with(base_path)) {
+      return tuple(fd, string_view(base_path));
+    }
+  }
+  return nullopt;
+}
+
+} // namespace impl
+} // namespace types
+
+Result<types::Descriptor *> open(string_view const &path) {
+  auto res = types::impl::relative_to(path);
+  if (!res.has_value())
+    // TODO(@zkat): EACCES probably. I gotta do better about this.
+    return host_api::Result<types::Descriptor *>::err(154);
+
+  auto &[fd, rel] = res.value();
+  // TODO(@zkat): flags
+  auto res = fd->open_at(0, rel, 0, 0);
+  return host_api::Result<types::Descriptor *>::ok(res.value());
+}
+
+namespace preopens {
+
+vector<tuple<types::Descriptor *, std::string>> *get_directories() {
+  wasi_filesystem_preopens_list_tuple2_own_descriptor_string_t ret{};
+  wasi_filesystem_preopens_get_directories(&ret);
+  // TODO(@zkat): uhhhh... construct stuff, I guess?
+}
+} // namespace preopens
+
+} // namespace filesystem
+optional<std::string> environment_initial_cwd() {
+  bindings_string_t ret{};
+  wasi_cli_environment_initial_cwd(&ret);
+  return std::string(reinterpret_cast<char *>(ret.ptr, ret.len));
 }
 
 } // namespace host_api

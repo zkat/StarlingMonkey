@@ -7,8 +7,8 @@
 #ifndef HANDLES_H
 #define HANDLES_H
 
-#include "host_api.h"
 #include "bindings/bindings.h"
+#include "host_api.h"
 
 #include <exports.h>
 #include <list>
@@ -208,6 +208,11 @@ template <> struct HandleOps<InputStream> {
   using borrowed = wasi_io_streams_borrow_input_stream_t;
 };
 
+template <> struct HandleOps<host_api::filesystem::types::Descriptor> {
+  using owned = wasi_filesystem_types_own_descriptor_t;
+  using borrowed = wasi_filesystem_types_borrow_descriptor_t;
+};
+
 class IncomingBodyHandle final : public WASIHandle<host_api::HttpIncomingBody> {
   HandleOps<InputStream>::owned stream_handle_;
   PollableHandle pollable_handle_;
@@ -250,5 +255,27 @@ public:
     return reinterpret_cast<OutgoingBodyHandle *>(handle);
   }
 };
+
+class IncomingDescriptorHandle final : public WASIHandle<host_api::filesystem::types::Descriptor> {
+  HandleOps<InputStream>::owned stream_handle_;
+  PollableHandle pollable_handle_;
+
+  friend host_api::filesystem::types::Descriptor;
+
+public:
+  explicit IncomingDescriptorHandle(HandleOps<host_api::filesystem::types::Descriptor>::owned handle, wasi_filesystem_types_filesize_t offset)
+      : WASIHandle(handle), pollable_handle_(INVALID_POLLABLE_HANDLE) {
+    HandleOps<InputStream>::owned stream{};
+    wasi_filesystem_types_error_code_t err{};
+    if (!wasi_filesystem_types_method_descriptor_read_via_stream(borrow(), offset, &stream, &err)) {
+    }
+    stream_handle_ = stream;
+  }
+
+  static IncomingDescriptorHandle *cast(HandleState *handle) {
+    return reinterpret_cast<IncomingDescriptorHandle *>(handle);
+  }
+};
+
 
 #endif
