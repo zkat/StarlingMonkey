@@ -535,6 +535,41 @@ public:
 
 vector<std::string> environment_get_arguments();
 
+namespace filesystem {
+
+namespace types {
+
+class Descriptor final : public Resource {
+public:
+  Descriptor() = delete;
+  explicit Descriptor(std::unique_ptr<HandleState> handle);
+
+  class ReadResult final {
+  public:
+    bool done = false;
+    HostBytes bytes;
+    ReadResult() = default;
+    ReadResult(const bool done, unique_ptr<uint8_t[]> ptr, size_t len)
+        : done{done}, bytes(std::move(ptr), len) {}
+  };
+
+  Result<Descriptor *> open_at(uint64_t path_flags, string_view path, uint64_t open_flags,
+                               uint64_t descriptor_flags);
+  Result<ReadResult> read_sync(size_t offset, uint64_t chunk_size);
+};
+} // namespace types
+
+Result<types::Descriptor *> open_at(uint64_t path_flags, string_view path, uint64_t open_flags,
+                                    uint64_t descriptor_flags);
+
+namespace preopens {
+vector<tuple<types::Descriptor *, std::string>> *preopens_get_directories();
+}
+} // namespace filesystem
+
+// TODO(@zkat): move this to an environment namespace, along with get_arguments.
+optional<std::string> environment_initial_cwd();
+
 } // namespace host_api
 
 #endif

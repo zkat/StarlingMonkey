@@ -214,7 +214,7 @@ static JSObject* get_builtin_module(JSContext* cx, HandleValue id, HandleObject 
   bool firstValue = true;
   for (size_t i = 0; i < length; ++i) {
     if (firstValue) {
-      firstValue = false;  
+      firstValue = false;
     } else {
       code += ", ";
     }
@@ -238,14 +238,14 @@ static JSObject* get_builtin_module(JSContext* cx, HandleValue id, HandleObject 
   firstValue = true;
   for (size_t i = 0; i < length; ++i) {
     if (firstValue) {
-      firstValue = false;  
+      firstValue = false;
     } else {
       code += ", ";
     }
 
     code += "e";
     code += std::to_string(i);
-    
+
     code += " as '";
     const auto &prop = props[i];
     JS::RootedValue key(cx, js::IdToValue(prop));
@@ -301,7 +301,7 @@ JSObject* module_resolve_hook(JSContext* cx, HandleValue referencingPrivate,
 
   RootedValue builtin_val(cx);
   if (!MapGet(cx, builtinModules, path_val, &builtin_val)) {
-    return nullptr; 
+    return nullptr;
   }
   if (!builtin_val.isUndefined()) {
     RootedValue specifier_val(cx, StringValue(specifier));
