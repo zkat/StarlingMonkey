@@ -995,6 +995,15 @@ Result<HttpIncomingBody *> HttpIncomingRequest::body() {
 
 namespace filesystem {
 
+namespace preopens {
+
+vector<tuple<types::Descriptor *, std::string>> *get_directories() {
+  wasi_filesystem_preopens_list_tuple2_own_descriptor_string_t ret{};
+  wasi_filesystem_preopens_get_directories(&ret);
+  // TODO(@zkat): uhhhh... construct stuff, I guess?
+}
+} // namespace preopens
+
 namespace types {
 
 Descriptor::Descriptor(std::unique_ptr<HandleState> state) { handle_state_ = std::move(state); }
@@ -1004,8 +1013,9 @@ Result<Descriptor *> Descriptor::open_at(uint64_t path_flags, string_view path, 
   wasi_filesystem_types_own_descriptor_t ret{};
   wasi_filesystem_types_error_code_t err{};
   auto borrow = Borrow<Descriptor>(handle_state_.get());
-  if (wasi_filesystem_types_method_descriptor_open_at(
-          borrow, path_flags, &string_view_to_world_string(path), open_flags, flags, &ret, &err)) {
+  auto str = string_view_to_world_string(path);
+  if (wasi_filesystem_types_method_descriptor_open_at(borrow, path_flags, &str, open_flags, flags,
+                                                      &ret, &err)) {
     auto state = new WASIHandle<Descriptor>(ret);
     return Result<Descriptor *>::ok(new Descriptor(std::unique_ptr<HandleState>(state)));
   } else {
@@ -1018,6 +1028,7 @@ Result<Descriptor *> Descriptor::open_at(uint64_t path_flags, string_view path, 
 }
 
 Result<Descriptor::ReadResult> Descriptor::read_sync(size_t offset, uint64_t chunk_size) {
+  // TODO(@zkat): use offset?
   typedef Result<ReadResult> Res;
 
   bindings_list_u8_t ret{};
@@ -1040,7 +1051,9 @@ namespace impl {
 // TODO(@zkat): Add appropriate stuff to the .h
 // TODO(@zkat): optional -> Result where failures are actually errors.
 
+using std::nullopt;
 using std::string;
+
 // All lazily initialized to avoid startup cost.
 static bool cwd_initialized{false};
 static optional<const string> cwd_str{nullopt};
@@ -1058,31 +1071,24 @@ optional<Descriptor *> get_init_cwd_fd() {
   }
 }
 
-optional<const Descriptor *> get_cwd() {
-  if (!cwd_initialized) {
-    cwd_str = host_api::environment_initial_cwd();
-    if (cwd_str.has_value()) {
-      string_view cwd_val = cwd_str.value();
-      auto base = relative_to(cwd_val, false);
-      if (base.has_value()) {
-        auto &[fd, base_path] = base.value();
-        // TODO(@zkat): uhhh... flags. Those are important. lol
-        auto res = fd->open_at(0, cwd_val.substr(base_path.length()), 0, 0);
-        // TODO(@zkat): I think this'll bubble up as an error in the right place
-        // just fine? Might change this function to return a Result later if I
-        // want it to give more explicit errors.
-        if (res.is_err())
-          return nullopt;
-        cwd_fd = res.unwrap();
-      }
-    }
-    cwd_initialized = true;
+// Helper. Assumes you're calling it through `relative_to`.
+optional<tuple<Descriptor *, const string_view>> find_base(string_view const &path) {
+  if (!preopens.has_value()) {
+    // Only initialize if we're actually going to try and open something.
+    preopens = preopens::get_directories();
   }
-  return cwd_fd;
-}
-
-optional<tuple<Descriptor *, const std::string_view>> relative_to(string_view const &path) {
-  return relative_to(path, cwd_initialized);
+  // NB(@zkat): Uhhh... I'm not _entirely_ sure the `*` here is appropriate but YOLO for
+  // now. Still wrapping my head around how pointer stuff is done in this
+  // project/wasi/etc.
+  for (auto &[fd, base_path] : *preopens.value()) {
+    // NB(@zkat): I am assuming, for right now, that the
+    // `preopens_get_directories()` paths are all absolute, since... I'm not
+    // sure where to start if I had to hand-resolve them.
+    if (path.starts_with(base_path)) {
+      return tuple(fd, string_view(base_path));
+    }
+  }
+  return nullopt;
 }
 
 optional<tuple<Descriptor *, const std::string_view>> relative_to(string_view const &path,
@@ -1129,24 +1135,31 @@ optional<tuple<Descriptor *, const std::string_view>> relative_to(string_view co
   return nullopt;
 }
 
-// Helper. Assumes you're calling it through `relative_to`.
-optional<tuple<Descriptor *, const string_view>> find_base(string_view const &path) {
-  if (!preopens.has_value()) {
-    // Only initialize if we're actually going to try and open something.
-    preopens = preopens::get_directories();
-  }
-  // NB(@zkat): Uhhh... I'm not _entirely_ sure the `*` here is appropriate but YOLO for
-  // now. Still wrapping my head around how pointer stuff is done in this
-  // project/wasi/etc.
-  for (auto &[fd, base_path] : *preopens.value()) {
-    // NB(@zkat): I am assuming, for right now, that the
-    // `preopens_get_directories()` paths are all absolute, since... I'm not
-    // sure where to start if I had to hand-resolve them.
-    if (path.starts_with(base_path)) {
-      return tuple(fd, string_view(base_path));
+optional<tuple<Descriptor *, const std::string_view>> relative_to(string_view const &path) {
+  return relative_to(path, cwd_initialized);
+}
+
+optional<const Descriptor *> get_cwd() {
+  if (!cwd_initialized) {
+    cwd_str = host_api::environment_initial_cwd();
+    if (cwd_str.has_value()) {
+      string_view cwd_val = cwd_str.value();
+      auto base = relative_to(cwd_val, false);
+      if (base.has_value()) {
+        auto &[fd, base_path] = base.value();
+        // TODO(@zkat): uhhh... flags. Those are important. lol
+        auto res = fd->open_at(0, cwd_val.substr(base_path.length()), 0, 0);
+        // TODO(@zkat): I think this'll bubble up as an error in the right place
+        // just fine? Might change this function to return a Result later if I
+        // want it to give more explicit errors.
+        if (res.is_err())
+          return nullopt;
+        cwd_fd = res.unwrap();
+      }
     }
+    cwd_initialized = true;
   }
-  return nullopt;
+  return cwd_fd;
 }
 
 } // namespace impl
@@ -1160,24 +1173,15 @@ Result<types::Descriptor *> open(string_view const &path) {
 
   auto &[fd, rel] = res.value();
   // TODO(@zkat): flags
-  auto res = fd->open_at(0, rel, 0, 0);
-  return host_api::Result<types::Descriptor *>::ok(res.value());
+  auto open_res = fd->open_at(0, rel, 0, 0);
+  return host_api::Result<types::Descriptor *>::ok(open_res.unwrap());
 }
-
-namespace preopens {
-
-vector<tuple<types::Descriptor *, std::string>> *get_directories() {
-  wasi_filesystem_preopens_list_tuple2_own_descriptor_string_t ret{};
-  wasi_filesystem_preopens_get_directories(&ret);
-  // TODO(@zkat): uhhhh... construct stuff, I guess?
-}
-} // namespace preopens
 
 } // namespace filesystem
 optional<std::string> environment_initial_cwd() {
   bindings_string_t ret{};
   wasi_cli_environment_initial_cwd(&ret);
-  return std::string(reinterpret_cast<char *>(ret.ptr, ret.len));
+  return std::string(reinterpret_cast<char *>(ret.ptr), ret.len);
 }
 
 } // namespace host_api
